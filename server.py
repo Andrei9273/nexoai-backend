@@ -1,159 +1,115 @@
-from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from dotenv import load_dotenv
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from pydantic import BaseModel
+from pymongo import MongoClient
 import os
-import uuid
+from dotenv import load_dotenv
+from bson import ObjectId
+from fastapi.responses import StreamingResponse, JSONResponse
+import asyncio
 import json
-import base64
-import logging
-from datetime import datetime, timezone
 
-# === LOAD .ENV ===
-load_dotenv(Path(__file__).parent / ".env")
+# Load environment variables
+load_dotenv()
 
 MONGO_URL = os.getenv("MONGO_URL")
-DB_NAME = os.getenv("DB_NAME")
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
-EMERGENT_LLM_KEY = os.getenv("EMERGENT_LLM_KEY")
+DB_NAME = os.getenv("DB_NAME", "ai_assistant_db")
 
-print("Loaded Mongo URL:", MONGO_URL)  # DEBUG — vezi exact ce se încarcă
-if not MONGO_URL or "mongodb" not in MONGO_URL:
-    raise RuntimeError("❌ Mongo URL not loaded properly from .env")
+# Initialize FastAPI app
+app = FastAPI()
 
-# === INIT MONGO ===
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
-
-# === FASTAPI APP ===
-app = FastAPI(title="Nexo AI Backend", version="1.0")
-
+# ✅ Allow frontend (Netlify) + localhost
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=[
+        "https://gregarious-clafoutis-9e1a09.netlify.app",  # site-ul tău Netlify
+        "http://localhost:5173",  # pentru testare locală
+    ],
     allow_credentials=True,
-    allow_origins=CORS_ORIGINS.split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-router = APIRouter(prefix="/api")
+# Connect to MongoDB
+client = MongoClient(MONGO_URL)
+db = client[DB_NAME]
+conversations = db["conversations"]
+messages = db["messages"]
 
-
-# === MODELS ===
+# Models
 class Message(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    conversation_id: str
-    role: str  # 'user' or 'assistant'
-    content: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    image_data: Optional[str] = None
-
-
-class Conversation(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    title: str
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class MessageCreate(BaseModel):
     conversation_id: str
     content: str
-    image_data: Optional[str] = None
+    image_data: str | None = None
 
-
-class ConversationCreate(BaseModel):
-    title: str = "New Conversation"
-
-
-# === ROUTES ===
-@router.get("/")
+@app.get("/")
 async def root():
     return {"message": "Nexo AI backend is running successfully 🚀"}
 
-
-@router.post("/conversations", response_model=Conversation)
-async def create_conversation(input: ConversationCreate):
-    conv = Conversation(title=input.title)
-    doc = conv.model_dump()
-    doc["created_at"] = doc["created_at"].isoformat()
-    doc["updated_at"] = doc["updated_at"].isoformat()
-    await db.conversations.insert_one(doc)
-    return conv
-
-
-@router.get("/conversations", response_model=List[Conversation])
+@app.get("/api/conversations")
 async def get_conversations():
-    convs = await db.conversations.find({}, {"_id": 0}).sort("updated_at", -1).to_list(100)
+    convs = list(conversations.find())
     for c in convs:
-        c["created_at"] = datetime.fromisoformat(c["created_at"])
-        c["updated_at"] = datetime.fromisoformat(c["updated_at"])
+        c["id"] = str(c["_id"])
+        del c["_id"]
     return convs
 
+@app.post("/api/conversations")
+async def create_conversation():
+    new_conv = {"title": "Conversație Nouă"}
+    result = conversations.insert_one(new_conv)
+    new_conv["id"] = str(result.inserted_id)
+    return new_conv
 
-@router.delete("/conversations/{conversation_id}")
+@app.delete("/api/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str):
-    await db.messages.delete_many({"conversation_id": conversation_id})
-    res = await db.conversations.delete_one({"id": conversation_id})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    messages.delete_many({"conversation_id": conversation_id})
+    conversations.delete_one({"_id": ObjectId(conversation_id)})
     return {"status": "deleted"}
 
-
-@router.get("/conversations/{conversation_id}/messages", response_model=List[Message])
+@app.get("/api/conversations/{conversation_id}/messages")
 async def get_messages(conversation_id: str):
-    msgs = await db.messages.find({"conversation_id": conversation_id}, {"_id": 0}).sort("timestamp", 1).to_list(1000)
+    msgs = list(messages.find({"conversation_id": conversation_id}))
     for m in msgs:
-        m["timestamp"] = datetime.fromisoformat(m["timestamp"])
+        m["id"] = str(m["_id"])
+        del m["_id"]
     return msgs
 
+@app.post("/api/chat/send")
+async def send_message(request: Request):
+    data = await request.json()
+    conversation_id = data.get("conversation_id")
+    content = data.get("content", "")
+    image_data = data.get("image_data")
 
-@router.post("/chat/send")
-async def send_message(input: MessageCreate):
-    user_msg = Message(conversation_id=input.conversation_id, role="user", content=input.content, image_data=input.image_data)
-    doc = user_msg.model_dump()
-    doc["timestamp"] = doc["timestamp"].isoformat()
-    await db.messages.insert_one(doc)
+    if not conversation_id or not content:
+        return JSONResponse({"error": "Mesaj invalid"}, status_code=400)
 
-    await db.conversations.update_one(
-        {"id": input.conversation_id},
-        {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}},
-    )
+    # Save user message
+    messages.insert_one({
+        "conversation_id": conversation_id,
+        "role": "user",
+        "content": content
+    })
 
-    # Aici ar fi integrarea AI (GPT, etc.)
-    ai_response = f"Echo: {input.content}"
+    # Simulate AI typing (test)
+    async def stream_response():
+        yield "data: " + json.dumps({"content": "Salut! 👋 Eu sunt Nexo AI.", "done": False}) + "\n\n"
+        await asyncio.sleep(0.5)
+        yield "data: " + json.dumps({"content": " Cum pot să te ajut astăzi?", "done": False}) + "\n\n"
+        await asyncio.sleep(0.5)
+        yield "data: " + json.dumps({"done": True}) + "\n\n"
 
-    ai_msg = Message(conversation_id=input.conversation_id, role="assistant", content=ai_response)
-    await db.messages.insert_one(ai_msg.model_dump())
+        # Save assistant reply
+        messages.insert_one({
+            "conversation_id": conversation_id,
+            "role": "assistant",
+            "content": "Salut! 👋 Eu sunt Nexo AI. Cum pot să te ajut astăzi?"
+        })
 
-    return {"reply": ai_response}
+    return StreamingResponse(stream_response(), media_type="text/event-stream")
 
+@app.post("/api/upload")
+async def upload_file(request: Request):
+    return {"status": "uploaded"}
 
-@router.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        base64_data = base64.b64encode(contents).decode("utf-8")
-        return {"data": base64_data, "filename": file.filename, "type": file.content_type}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# === REGISTER ROUTER ===
-app.include_router(router)
-
-
-# === SHUTDOWN EVENT ===
-@app.on_event("shutdown")
-async def close_db():
-    client.close()
-
-
-# === LOGGING ===
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
