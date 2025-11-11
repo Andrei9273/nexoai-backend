@@ -1,58 +1,80 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pymongo import MongoClient
 from pydantic import BaseModel
-from bson import ObjectId
+from fastapi.responses import StreamingResponse
+import asyncio
+import json
 import os
 
 app = FastAPI()
 
-# === CORS ===
-origins = [
-    "https://gregarious-clafoutis-9e1a09.netlify.app",
-    "http://localhost:5173"
-]
-
+# ✅ CORS fix complet pentru Netlify + Render
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # poți pune aici domeniul Netlify dacă vrei restrictiv
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === DATABASE ===
-MONGO_URL = os.getenv("MONGO_URL")
-DB_NAME = os.getenv("DB_NAME")
-
-try:
-    client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000, tls=True)
-    db = client[DB_NAME]
-    print("✅ Connected to MongoDB successfully")
-except Exception as e:
-    print("❌ MongoDB connection failed:", e)
-
-# === MODELS ===
-class Conversation(BaseModel):
-    title: str
-
-# === ROUTES ===
-@app.get("/")
-def home():
+# =========================
+# ✅ Test backend
+# =========================
+@app.get("/api")
+async def root():
     return {"message": "Nexo AI backend is running successfully 🚀"}
 
-@app.post("/api/conversations")
-def create_conversation(conv: Conversation):
-    try:
-        result = db.conversations.insert_one({"title": conv.title})
-        return {"id": str(result.inserted_id), "title": conv.title}
-    except Exception as e:
-        return {"error": f"Failed to insert conversation: {str(e)}"}
+# =========================
+# ✅ Modele
+# =========================
+class ChatRequest(BaseModel):
+    conversation_id: str
+    content: str
+    image_data: str | None = None
+
+class Conversation(BaseModel):
+    id: str
+    title: str
+
+# =========================
+# ✅ Rute conversații (simulate)
+# =========================
+conversations = []
 
 @app.get("/api/conversations")
-def get_conversations():
+async def get_conversations():
+    return conversations
+
+@app.post("/api/conversations")
+async def create_conversation():
+    new_conv = {"id": str(len(conversations) + 1), "title": "Conversație Nouă"}
+    conversations.append(new_conv)
+    return new_conv
+
+# =========================
+# ✅ Răspuns AI – endpointul care lipsea
+# =========================
+@app.post("/api/chat/send")
+async def send_message(req: ChatRequest):
     try:
-        conversations = list(db.conversations.find({}, {"_id": 1, "title": 1}))
-        return [{"id": str(c["_id"]), "title": c["title"]} for c in conversations]
+        user_message = req.content
+
+        async def event_stream():
+            # Simulare flux de răspuns (streaming text)
+            text = f"AI: am primit mesajul tău → {user_message}"
+            for c in text:
+                yield f"data: {json.dumps({'content': c})}\n\n"
+                await asyncio.sleep(0.02)
+            yield f"data: {json.dumps({'done': True})}\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
     except Exception as e:
-        return {"error": f"Failed to fetch conversations: {str(e)}"}
+        return {"error": str(e)}
+
+# =========================
+# ✅ Pornire locală
+# =========================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
