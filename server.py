@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from pydantic import BaseModel
@@ -7,11 +7,10 @@ import os
 
 app = FastAPI()
 
-# --- CORS CONFIG ---
+# === CORS ===
 origins = [
-    "http://localhost:5173",
     "https://gregarious-clafoutis-9e1a09.netlify.app",
-    "*"
+    "http://localhost:5173"
 ]
 
 app.add_middleware(
@@ -22,25 +21,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE CONFIG ---
+# === DATABASE ===
 MONGO_URL = os.getenv("MONGO_URL")
 DB_NAME = os.getenv("DB_NAME")
 
-client = MongoClient(MONGO_URL, tls=True)
-db = client[DB_NAME]
+try:
+    client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000, tls=True)
+    db = client[DB_NAME]
+    print("✅ Connected to MongoDB successfully")
+except Exception as e:
+    print("❌ MongoDB connection failed:", e)
 
-# --- MODELS ---
+# === MODELS ===
 class Conversation(BaseModel):
     title: str
 
-class Message(BaseModel):
-    conversation_id: str
-    role: str
-    content: str
-
-# --- ROUTES ---
+# === ROUTES ===
 @app.get("/")
-def root():
+def home():
     return {"message": "Nexo AI backend is running successfully 🚀"}
 
 @app.post("/api/conversations")
@@ -49,9 +47,12 @@ def create_conversation(conv: Conversation):
         result = db.conversations.insert_one({"title": conv.title})
         return {"id": str(result.inserted_id), "title": conv.title}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Failed to insert conversation: {str(e)}"}
 
 @app.get("/api/conversations")
 def get_conversations():
-    conversations = list(db.conversations.find({}, {"_id": 1, "title": 1}))
-    return [{"id": str(c["_id"]), "title": c["title"]} for c in conversations]
+    try:
+        conversations = list(db.conversations.find({}, {"_id": 1, "title": 1}))
+        return [{"id": str(c["_id"]), "title": c["title"]} for c in conversations]
+    except Exception as e:
+        return {"error": f"Failed to fetch conversations: {str(e)}"}
