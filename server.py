@@ -1,80 +1,107 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.responses import StreamingResponse
-import asyncio
-import json
+from pymongo import MongoClient
+from bson import ObjectId
 import os
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
-# ✅ CORS fix complet pentru Netlify + Render
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # poți pune aici domeniul Netlify dacă vrei restrictiv
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# ✅ Test backend
-# =========================
-@app.get("/api")
-async def root():
-    return {"message": "Nexo AI backend is running successfully 🚀"}
+# MongoDB
+mongo_url = os.getenv("MONGO_URL")
+db_name = os.getenv("DB_NAME", "ai_assistant_db")
+client = MongoClient(mongo_url)
+db = client[db_name]
+conversations = db["conversations"]
+messages = db["messages"]
 
-# =========================
-# ✅ Modele
-# =========================
-class ChatRequest(BaseModel):
+# LLM API key
+LLM_KEY = os.getenv("EMERGENT_LLM_KEY")
+
+# Models
+class ChatMessage(BaseModel):
     conversation_id: str
     content: str
-    image_data: str | None = None
 
-class Conversation(BaseModel):
-    id: str
-    title: str
-
-# =========================
-# ✅ Rute conversații (simulate)
-# =========================
-conversations = []
+@app.get("/")
+async def root():
+    return {"message": "✅ Nexo AI backend is running successfully"}
 
 @app.get("/api/conversations")
 async def get_conversations():
-    return conversations
+    data = []
+    for conv in conversations.find():
+        data.append({"id": str(conv["_id"]), "title": conv["title"]})
+    return data
 
 @app.post("/api/conversations")
 async def create_conversation():
-    new_conv = {"id": str(len(conversations) + 1), "title": "Conversație Nouă"}
-    conversations.append(new_conv)
-    return new_conv
+    conv = {"title": "Conversație Nouă"}
+    result = conversations.insert_one(conv)
+    return {"id": str(result.inserted_id), "title": conv["title"]}
 
-# =========================
-# ✅ Răspuns AI – endpointul care lipsea
-# =========================
+@app.get("/api/conversations/{conversation_id}/messages")
+async def get_messages(conversation_id: str):
+    data = []
+    for msg in messages.find({"conversation_id": conversation_id}):
+        data.append({
+            "id": str(msg["_id"]),
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+    return data
+
 @app.post("/api/chat/send")
-async def send_message(req: ChatRequest):
-    try:
-        user_message = req.content
+async def send_message(request: Request):
+    body = await request.json()
+    conv_id = body.get("conversation_id")
+    user_message = body.get("content")
 
-        async def event_stream():
-            # Simulare flux de răspuns (streaming text)
-            text = f"AI: am primit mesajul tău → {user_message}"
-            for c in text:
-                yield f"data: {json.dumps({'content': c})}\n\n"
-                await asyncio.sleep(0.02)
-            yield f"data: {json.dumps({'done': True})}\n\n"
+    # Save user message
+    messages.insert_one({
+        "conversation_id": conv_id,
+        "role": "user",
+        "content": user_message
+    })
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    # 🔥 Generate AI reply via Emergent LLM API
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.emergent.llm/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {LLM_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "emergent-large",
+                "messages": [
+                    {"role": "system", "content": "You are Nexo AI, a helpful assistant created by Andrei."},
+                    {"role": "user", "content": user_message}
+                ]
+            }
+        )
 
-    except Exception as e:
-        return {"error": str(e)}
+    data = response.json()
+    ai_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "Nexo AI: răspuns indisponibil 🫣")
 
-# =========================
-# ✅ Pornire locală
-# =========================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    # Save AI reply
+    messages.insert_one({
+        "conversation_id": conv_id,
+        "role": "assistant",
+        "content": ai_reply
+    })
+
+    return {"response": ai_reply}
